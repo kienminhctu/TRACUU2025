@@ -141,8 +141,9 @@ def read_excel_to_records(xlsx_path) -> (List[Dict], List[str]):
     return records, valid_sheets
 
 # --- Search functions ---
-# Thay thế toàn bộ hàm search_fts cũ bằng hàm này
-import re, unicodedata, sqlite3
+# Thay thế toàn bộ hàm search_fts bằng hàm này (debug-safe)
+import re, unicodedata, sqlite3, traceback
+import streamlit as st
 
 def normalize_text(s):
     if s is None:
@@ -153,68 +154,92 @@ def normalize_text(s):
 
 def search_fts(conn, query: str, category: str = None, limit: int = 500):
     """
-    Tìm kiếm an toàn: ưu tiên FTS (nếu có), nếu FTS lỗi -> fallback dùng search_text LIKE.
-    Trả list[dict].
+    Robust search: try FTS (qfts_search) then fallback to search_text LIKE.
+    This version prints debug info (sql + params + exception) to the UI for diagnosis.
     """
     q = (query or "").strip()
     cur = conn.cursor()
 
-    # nếu rỗng query -> trả all (hoặc theo category)
+    # empty query => return all or filtered by category
     if q == "":
-        if category and category != "(Tất cả)":
-            cur.execute("SELECT rowid, * FROM questions WHERE category = ? LIMIT ?", (category, limit))
-        else:
-            cur.execute("SELECT rowid, * FROM questions LIMIT ?", (limit,))
-        return [dict(r) for r in cur.fetchall()]
+        try:
+            if category and category != "(Tất cả)":
+                cur.execute("SELECT rowid, * FROM questions WHERE category = ? LIMIT ?", (category, limit))
+            else:
+                cur.execute("SELECT rowid, * FROM questions LIMIT ?", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            st.error("Debug SQL error (empty query): " + repr(e))
+            return []
 
     nq = normalize_text(q)
     tokens = [t for t in re.split(r"\s+", nq) if t]
 
-    # 1) thử FTS trên qfts_search nếu tồn tại — nhưng bọc try/except để tránh crash
+    # 1) Try FTS on qfts_search (guarded)
     try:
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='qfts_search'")
         if cur.fetchone():
-            # dùng MATCH trên trường search_text (đã normalize)
-            match_q = nq  # FTS query: we keep normalized plain text
+            # prepare FTS query (we use normalized search_text content)
+            match_q = nq
             if category and category != "(Tất cả)":
-                sql = "SELECT q.rowid, q.* FROM qfts_search f JOIN questions q ON q.rowid=f.rowid WHERE q.category = ? AND f.search_text MATCH ? LIMIT ?"
+                sql = "SELECT q.rowid, q.* FROM qfts_search f JOIN questions q ON q.rowid = f.rowid WHERE q.category = ? AND f.search_text MATCH ? LIMIT ?"
                 params = (category, match_q, limit)
             else:
-                sql = "SELECT q.rowid, q.* FROM qfts_search f JOIN questions q ON q.rowid=f.rowid WHERE f.search_text MATCH ? LIMIT ?"
+                sql = "SELECT q.rowid, q.* FROM qfts_search f JOIN questions q ON q.rowid = f.rowid WHERE f.search_text MATCH ? LIMIT ?"
                 params = (match_q, limit)
+            # debug print (temporary)
+            st.debug = getattr(st, "debug", None)
+            try:
+                # show debug info for diagnosis
+                st.info(f"[DEBUG] Trying FTS. SQL: {sql}  params={params}")
+            except Exception:
+                pass
             try:
                 cur.execute(sql, params)
                 rows = [dict(r) for r in cur.fetchall()]
                 if rows:
                     return rows
-            except sqlite3.OperationalError:
-                # nếu FTS MATCH gặp lỗi ở runtime, ta sẽ fallback bên dưới
-                pass
-    except Exception:
-        # bất kỳ lỗi truy vấn metadata cũng bỏ qua và sử dụng fallback
-        pass
+            except Exception as e:
+                # log the low-level exception to UI (for you to copy)
+                st.error("[DEBUG] FTS query error: " + repr(e))
+                # also show traceback on UI for diagnosis (safe since it's your app)
+                st.text("".join(traceback.format_exc()))
+                # fall through to LIKE fallback
+    except Exception as e:
+        st.error("[DEBUG] Metadata check for qfts_search failed: " + repr(e))
+        st.text("".join(traceback.format_exc()))
 
-    # 2) Fallback an toàn: tìm bằng search_text LIKE (AND trên token)
-    if not tokens:
-        return []
+    # 2) Fallback: use normalized search_text LIKE with AND tokens
+   # --- Fallback LIKE (no diacritics, safe on Cloud) ---
+if not tokens:
+    return []
 
-    clauses = []
-    params = []
-    if category and category != "(Tất cả)":
-        clauses.append("category = ?")
-        params.append(category)
+clauses = []
+params = []
+if category and category != "(Tất cả)":
+    clauses.append("category = ?")
+    params.append(category)
 
-    # mỗi token phải xuất hiện trong cột search_text (đã normalized)
-    for t in tokens:
-        clauses.append("search_text LIKE ?")
-        params.append(f"%{t}%")
+for t in tokens:
+    clauses.append("search_text LIKE ?")
+    params.append(f"%{t}%")
 
-    sql = "SELECT rowid, * FROM questions WHERE " + " AND ".join(clauses) + " LIMIT ?"
-    params.append(limit)
-    # đảm bảo params là tuple khi truyền xuống sqlite
+where_clause = " AND ".join(clauses)
+# ⚠️ KHÔNG dùng LIMIT ? vì Cloud SQLite không hỗ trợ binding LIMIT
+sql = f"SELECT rowid, * FROM questions WHERE {where_clause} LIMIT {int(limit)}"
+
+st.info(f"[DEBUG] Safe SQL: {sql}")
+st.info(f"[DEBUG] Params: {params}")
+
+try:
     cur.execute(sql, tuple(params))
-    return [dict(r) for r in cur.fetchall()]
-
+    rows = [dict(r) for r in cur.fetchall()]
+    return rows
+except Exception as e:
+    st.error("[DEBUG] Fallback SQL error: " + repr(e))
+    import traceback
+    st.text("".join(traceback.format_exc()))
+    return []
 
 
 def get_all_categories(conn):
