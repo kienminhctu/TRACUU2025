@@ -1,524 +1,170 @@
-# app_streamlit.py
-"""
-Streamlit app: Tra cứu câu hỏi & đáp án (SQLite FTS5 backend)
-- Nếu có questions.db trong thư mục, dùng luôn.
-- Nếu upload file .xlsx hoặc đặt Ngan_hang_cau_hoi.xlsx, sẽ chuyển sang SQLite (FTS) và index.
-- UI: tìm kiếm FTS, filter category, tìm theo ID, pagination, highlight, download CSV.
-"""
-
+# app_streamlit.py  — Minimal, robust Streamlit search app (pandas, no sqlite)
 import streamlit as st
-from pathlib import Path
-import sqlite3, io, re, tempfile, os
 import pandas as pd
-import unicodedata
-from typing import List, Dict
+import unicodedata, re, io
+from pathlib import Path
 
-st.set_page_config(page_title="Tra cứu câu hỏi", layout="wide")
+st.set_page_config(page_title="Tra cứu câu hỏi (simple)", layout="wide")
 
-# --- Config ---
 DEFAULT_XLSX = "Ngan_hang_cau_hoi.xlsx"
-DB_FILE = Path("questions.db")
-REQUIRED_COLS = ["ID","category","question","option_a","option_b","option_c","option_d","correct"]
-PAGE_SIZE_DEFAULT = 20
+REQUIRED = ["ID","category","question","option_a","option_b","option_c","option_d","correct"]
 
-# --- Utils ---
 def normalize_text(s: str) -> str:
     if s is None: return ""
-    s = str(s).strip().lower()
+    s = str(s).lower().strip()
     s = unicodedata.normalize("NFD", s)
     return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
 
-def safe_str(x):
-    return "" if x is None else str(x)
-
-def strip_choice_prefix(text, expected_letter: str):
-    if text is None: return ""
-    s = str(text).lstrip()
-    pat = rf'^(?:{expected_letter}|{expected_letter.lower()})\s*[\.\)\:\-–\/]\s*'
-    return re.sub(pat, "", s, count=1)
-
-# --- DB functions ---
-@st.cache_resource
-def get_conn(db_path: str = str(DB_FILE)):
-    # returns sqlite3.Connection
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def has_fts5(conn) -> bool:
+@st.cache_data
+def load_excel(path_or_bytes):
+    # path_or_bytes may be a Path/str or a BytesIO (uploaded file)
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT sqlite_version()")
-        # try creating temp fts table (wrap in transaction and drop)
-        cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS __ftstest USING fts5(content)")
-        cur.execute("DROP TABLE IF EXISTS __ftstest")
-        conn.commit()
-        return True
-    except Exception:
-        return False
-
-def create_schema(conn):
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS questions (
-        id TEXT,
-        sheet TEXT,
-        category TEXT,
-        question TEXT,
-        option_a TEXT,
-        option_b TEXT,
-        option_c TEXT,
-        option_d TEXT,
-        correct TEXT
-    )
-    """)
-    # create FTS table if supported
-    try:
-        cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS qfts USING fts5(question, option_a, option_b, option_c, option_d, content='questions', content_rowid='rowid')")
-    except Exception:
-        # FTS5 not supported — caller should fallback
-        pass
-    conn.commit()
-
-def clear_and_insert_questions(conn, records: List[Dict]):
-    cur = conn.cursor()
-    cur.execute("DELETE FROM questions")
-    conn.commit()
-    insert_sql = "INSERT INTO questions (id, sheet, category, question, option_a, option_b, option_c, option_d, correct) VALUES (?,?,?,?,?,?,?,?,?)"
-    for r in records:
-        cur.execute(insert_sql, (
-            safe_str(r.get("ID")),
-            safe_str(r.get("sheet")),
-            safe_str(r.get("category")),
-            safe_str(r.get("question")),
-            safe_str(r.get("option_a")),
-            safe_str(r.get("option_b")),
-            safe_str(r.get("option_c")),
-            safe_str(r.get("option_d")),
-            safe_str(r.get("correct")),
-        ))
-    conn.commit()
-    # populate FTS table if exists
-    try:
-        cur.execute("DELETE FROM qfts")
-        cur.execute("INSERT INTO qfts(rowid, question, option_a, option_b, option_c, option_d) SELECT rowid, question, option_a, option_b, option_c, option_d FROM questions")
-        conn.commit()
-    except Exception:
-        # FTS not available; ignore
-        pass
-
-def read_excel_to_records(xlsx_path) -> (List[Dict], List[str]):
-    # returns (records_list, valid_sheets)
-    df_dict = pd.read_excel(xlsx_path, sheet_name=None, dtype=str)
+        if isinstance(path_or_bytes, (str, Path)):
+            x = pd.read_excel(path_or_bytes, sheet_name=None, dtype=str)
+        else:
+            # BytesIO
+            x = pd.read_excel(path_or_bytes, sheet_name=None, dtype=str)
+    except Exception as e:
+        raise
     records = []
-    valid_sheets = []
-    for sh, df in df_dict.items():
-        if str(sh).startswith("_"):
-            continue
-        if df is None or df.shape[0] == 0:
-            continue
-        # normalize column names
+    for sh, df in x.items():
+        if str(sh).startswith("_"): continue
+        if df is None or df.shape[0] == 0: continue
         df.columns = [str(c).strip() for c in df.columns]
-        if not all(col in df.columns for col in REQUIRED_COLS):
+        if not all(c in df.columns for c in REQUIRED):
+            # skip sheet if missing columns
             continue
-        valid_sheets.append(sh)
         for _, row in df.iterrows():
-            qtext = safe_str(row.get("question")).strip()
-            if not qtext:
-                continue
+            q = str(row.get("question") or "").strip()
+            if not q: continue
             rec = {
                 "sheet": sh,
-                "ID": safe_str(row.get("ID")).strip(),
-                "category": safe_str(row.get("category")).strip(),
-                "question": qtext,
-                "option_a": strip_choice_prefix(row.get("option_a"), "A"),
-                "option_b": strip_choice_prefix(row.get("option_b"), "B"),
-                "option_c": strip_choice_prefix(row.get("option_c"), "C"),
-                "option_d": strip_choice_prefix(row.get("option_d"), "D"),
-                "correct": safe_str(row.get("correct")).strip().upper(),
+                "ID": str(row.get("ID") or "").strip(),
+                "category": str(row.get("category") or "").strip(),
+                "question": q,
+                "option_a": str(row.get("option_a") or "").strip(),
+                "option_b": str(row.get("option_b") or "").strip(),
+                "option_c": str(row.get("option_c") or "").strip(),
+                "option_d": str(row.get("option_d") or "").strip(),
+                "correct": str(row.get("correct") or "").strip().upper(),
             }
+            rec["_search"] = normalize_text(" ".join([rec["question"], rec["option_a"], rec["option_b"], rec["option_c"], rec["option_d"]]))
             records.append(rec)
-    return records, valid_sheets
+    return records
 
-# --- Search functions ---
-# Thay thế toàn bộ hàm search_fts bằng hàm này (debug-safe)
-import re, unicodedata, sqlite3, traceback
-import streamlit as st
+def search_records(records, query, category=None, limit=1000):
+    qn = normalize_text(query or "")
+    out = []
+    for r in records:
+        if category and category != "(Tất cả)" and r.get("category","") != category:
+            continue
+        if qn == "" or qn in r["_search"]:
+            out.append(r)
+        # also support exact ID search if user typed "ID:xxx" or only numbers
+    return out[:limit]
 
-def normalize_text(s):
-    if s is None:
-        return ""
-    s = str(s).lower()
-    s = unicodedata.normalize("NFD", s)
-    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-
-def search_fts(conn, query: str, category: str = None, limit: int = 500):
-    """
-    Tìm kiếm an toàn: ưu tiên FTS trên qfts_search (nếu có),
-    nếu FTS không trả kết quả hoặc lỗi thì fallback dùng search_text LIKE.
-    Trả list[dict].
-    """
-    q = (query or "").strip()
-    cur = conn.cursor()
-
-    # Nếu không có từ khóa: trả toàn bộ hoặc theo category
-    if q == "":
-        try:
-            if category and category != "(Tất cả)":
-                cur.execute("SELECT rowid, * FROM questions WHERE category = ? LIMIT ?", (category, limit))
-            else:
-                cur.execute("SELECT rowid, * FROM questions LIMIT ?", (limit,))
-            return [dict(r) for r in cur.fetchall()]
-        except Exception as e:
-            # Nếu lỗi ở đây, trả empty list thay vì crash
-            st.error("[DEBUG] Error fetching empty-query results: " + repr(e))
-            return []
-
-    # normalize query (không dấu)
-    nq = normalize_text(q)
-    tokens = [t for t in re.split(r"\s+", nq) if t]
-    if not tokens:
-        return []
-
-    # 1) Thử FTS trên qfts_search (nếu tồn tại)
-    try:
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='qfts_search'")
-        if cur.fetchone():
-            # BUILD và chạy truy vấn FTS — bọc try để không làm crash
-            try:
-                if category and category != "(Tất cả)":
-                    sql = "SELECT q.rowid, q.* FROM qfts_search f JOIN questions q ON q.rowid = f.rowid WHERE q.category = ? AND f.search_text MATCH ? LIMIT ?"
-                    params = (category, nq, limit)
-                else:
-                    sql = "SELECT q.rowid, q.* FROM qfts_search f JOIN questions q ON q.rowid = f.rowid WHERE f.search_text MATCH ? LIMIT ?"
-                    params = (nq, limit)
-                # debug info (tạm)
-                st.info(f"[DEBUG] Trying FTS. SQL: {sql}  params={params}")
-                cur.execute(sql, params)
-                rows = [dict(r) for r in cur.fetchall()]
-                if rows:
-                    return rows
-            except sqlite3.OperationalError as e:
-                # FTS có thể không hỗ trợ MATCH theo cách này trên cloud — fallback tiếp
-                st.error("[DEBUG] FTS OperationalError: " + repr(e))
-            except Exception as e:
-                st.error("[DEBUG] FTS error: " + repr(e))
-    except Exception:
-        # nếu metadata check lỗi, tiếp tục fallback
-        pass
-
-    # 2) Fallback: tìm trong search_text dùng LIKE (AND token)
-    clauses = []
-    params = []
-    if category and category != "(Tất cả)":
-        clauses.append("category = ?")
-        params.append(category)
-
-    for t in tokens:
-        clauses.append("search_text LIKE ?")
-        params.append(f"%{t}%")
-
-    # Nếu không có điều kiện (không nên xảy ra vì tokens đã kiểm tra), trả rỗng
-    if not clauses:
-        return []
-
-    # NOTE: không dùng parameter hóa LIMIT do một số build sqlite không hỗ trợ binding cho LIMIT
-    where_clause = " AND ".join(clauses)
-    sql = f"SELECT rowid, * FROM questions WHERE {where_clause} LIMIT {int(limit)}"
-
-    # debug info (hiển thị tạm thời trên UI để bạn thấy)
-    st.info(f"[DEBUG] Fallback SQL: {sql}")
-    st.info(f"[DEBUG] Fallback params: {params}")
-
-    try:
-        cur.execute(sql, tuple(params))
-        rows = [dict(r) for r in cur.fetchall()]
-        return rows
-    except Exception as e:
-        st.error("[DEBUG] Fallback SQL error: " + repr(e))
-        st.text("".join(traceback.format_exc()))
-        return []
-
-
-def get_all_categories(conn):
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT DISTINCT category FROM questions WHERE category IS NOT NULL AND category != ''")
-        rows = cur.fetchall()
-        cats = [r[0] for r in rows]
-        cats = sorted([c for c in cats if c])
-        return cats
-    except Exception:
-        return []
-
-def get_by_id(conn, id_text):
-    cur = conn.cursor()
-    t = id_text.strip()
-    # try both id and sheet-id
-    cur.execute("SELECT rowid, * FROM questions WHERE id = ? LIMIT 1", (t,))
-    r = cur.fetchone()
-    if r: return dict(r)
-    # try sheet-id pattern: "De3-123"
-    if "-" in t:
-        try_sh, try_id = t.split("-", 1)
-        cur.execute("SELECT rowid, * FROM questions WHERE sheet = ? AND id = ? LIMIT 1", (try_sh, try_id))
-        r = cur.fetchone()
-        if r: return dict(r)
-    return None
-
-# --- UI helpers ---
-def highlight(text: str, keyword: str) -> str:
-    if not keyword:
-        return text
-    # escape regex metachars
-    kw = re.escape(keyword)
-    try:
-        return re.sub(f"({kw})", r"<mark>\1</mark>", text, flags=re.I)
-    except re.error:
-        return text
-
-def records_to_df(recs: List[Dict]) -> pd.DataFrame:
-    if not recs:
-        return pd.DataFrame(columns=["sheet","ID","category","question","option_a","option_b","option_c","option_d","correct"])
-    df = pd.DataFrame(recs)
-    # ensure columns order
-    cols = ["sheet","ID","category","question","option_a","option_b","option_c","option_d","correct"]
-    df = df.loc[:, [c for c in cols if c in df.columns]]
-    return df
-
-# --- App layout ---
-st.title("🔎 Tra cứu câu hỏi & đáp án (Streamlit)")
+# --- UI ---
+st.title("🔎 Tra cứu câu hỏi & đáp án (simple)")
 
 with st.sidebar:
-    st.header("Dữ liệu / Index")
-    uploaded = st.file_uploader("Upload file Excel (.xlsx) để index (tạo/ghi đè DB)", type=["xlsx"], accept_multiple_files=False)
+    st.header("Dữ liệu")
+    uploaded = st.file_uploader("Upload file Excel (.xlsx) để dùng", type=["xlsx"])
     use_default = st.checkbox(f"Dùng file mặc định `{DEFAULT_XLSX}` nếu có", value=True)
-    if st.button("Tạo/ghi lại index từ file"):
-        # create DB from uploaded or default
-        src = None
-        if uploaded is not None:
-            src = uploaded
-        else:
-            p = Path(DEFAULT_XLSX)
-            if p.exists():
-                src = p
-        if src is None:
-            st.warning("Không tìm thấy file upload hoặc file mặc định.")
-        else:
-            try:
-                # read records
-                if hasattr(src, "read"):
-                    # uploaded BytesIO
-                    bytes_io = io.BytesIO(src.read())
-                    records, sheets = read_excel_to_records(bytes_io)
-                else:
-                    records, sheets = read_excel_to_records(src)
-                if not records:
-                    st.error("Không có record hợp lệ trong file hoặc thiếu header required.")
-                else:
-                    # ensure DB file exists
-                    conn = sqlite3.connect(str(DB_FILE))
-                    create_schema(conn)
-                    clear_and_insert_questions(conn, records)
-                    conn.close()
-                    # clear cached conn and recreate
-                    if "get_conn" in st.session_state:
-                        st.session_state.pop("get_conn", None)
-                    st.success(f"Đã index {len(records)} câu từ {len(sheets)} sheet → {DB_FILE}")
-            except Exception as e:
-                st.error(f"Lỗi khi index: {e}")
-
     st.markdown("---")
-    st.markdown("Nếu bạn không index file, app sẽ sử dụng `questions.db` nếu có.")
-    st.markdown("Gợi ý: dùng file nhỏ hoặc để người dùng upload để tránh lưu file lớn trong repo.")
-    st.markdown("---")
-    st.caption("Bạn có thể upload file mới và click 'Tạo/ghi lại index' để cập nhật data.")
+    st.markdown("Nếu không có file, upload file hoặc đẩy file `questions.db`/Excel vào repo.")
 
-# Load DB or index from default if exists
-db_exists = DB_FILE.exists()
-if not db_exists and use_default and Path(DEFAULT_XLSX).exists():
-    # auto index default file
+# Load data (uploaded first, else default file if exists)
+records = []
+if uploaded is not None:
     try:
-        records, sheets = read_excel_to_records(DEFAULT_XLSX)
-        if records:
-            conn_tmp = sqlite3.connect(str(DB_FILE))
-            create_schema(conn_tmp)
-            clear_and_insert_questions(conn_tmp, records)
-            conn_tmp.close()
-            db_exists = True
-    except Exception:
-        db_exists = False
-
-if not db_exists:
-    st.warning("Chưa có database index. Upload file Excel rồi 'Tạo/ghi lại index' hoặc đặt questions.db/Ngan_hang_cau_hoi.xlsx vào thư mục.")
-    # still allow continue but search will return empty
+        bytes_io = io.BytesIO(uploaded.read())
+        records = load_excel(bytes_io)
+        st.sidebar.success(f"Đã nạp {len(records)} câu từ file upload.")
+    except Exception as e:
+        st.sidebar.error(f"Lỗi đọc file upload: {e}")
+elif use_default and Path(DEFAULT_XLSX).exists():
+    try:
+        records = load_excel(DEFAULT_XLSX)
+        st.sidebar.success(f"Đã nạp {len(records)} câu từ `{DEFAULT_XLSX}`.")
+    except Exception as e:
+        st.sidebar.error(f"Lỗi đọc default file: {e}")
 else:
-    conn = get_conn()
-    # verify schema
-    create_schema(conn)
+    st.sidebar.info("Chưa nạp dữ liệu. Upload file Excel hoặc đặt file mặc định vào thư mục deploy.")
 
-# --- Search controls ---
-col1, col2, col3 = st.columns([4,2,2])
+# Controls
+col1, col2, col3 = st.columns([4,2,1])
 with col1:
-    query = st.text_input("Từ khóa tìm (FTS hỗ trợ phrase / AND / OR). Để trống để hiện tất cả:", "")
+    query = st.text_input("Từ khóa tìm (viết có/không dấu):", "")
 with col2:
     id_search = st.text_input("Tìm theo ID (ví dụ De3-123 hoặc 123):", "")
 with col3:
-    page_size = st.selectbox("Bản ghi / trang", options=[10,20,50,100], index=1)
+    per_page = st.selectbox("Bản ghi / trang", [10,20,50], index=1)
 
-# category filter
-all_categories = []
-if DB_FILE.exists():
-    try:
-        all_categories = get_all_categories(get_conn())
-    except Exception:
-        all_categories = []
-cat_choice = st.selectbox("Lọc theo nhóm (category)", options=["(Tất cả)"] + all_categories)
+# categories
+cats = sorted(list({r.get("category","") for r in records if r.get("category","")}))
+cat_choice = st.selectbox("Lọc theo nhóm (category)", options=["(Tất cả)"] + cats)
 
-# --- Execute search ---
+# If ID search given, try to show single
 results = []
 if id_search.strip():
-    if DB_FILE.exists():
-        r = get_by_id(get_conn(), id_search.strip())
-        if r:
-            results = [r]
-        else:
-            st.info("Không tìm thấy ID.")
-            results = []
-    else:
-        st.info("DB chưa có; không thể tìm ID.")
-        results = []
+    t = id_search.strip()
+    for r in records:
+        if r.get("ID") == t or f"{r.get('sheet')}-{r.get('ID')}" == t:
+            results = [r]; break
 else:
-    if DB_FILE.exists():
-        results = search_fts(get_conn(), query, category=cat_choice, limit=2000)
-    else:
-        results = []
+    results = search_records(records, query, category=cat_choice if cat_choice else None, limit=5000)
 
-st.write(f"**Kết quả: {len(results)} bản ghi**")
+st.markdown(f"**Kết quả: {len(results)} bản ghi**")
 
-# Pagination
+# pagination
+page = st.session_state.get("page", 1)
 total = len(results)
-total_pages = max(1, (total + page_size - 1) // page_size)
-if 'page' not in st.session_state:
-    st.session_state.page = 1
-# reset page if smaller result
-if st.session_state.page > total_pages:
-    st.session_state.page = 1
+pages = max(1, (total + per_page - 1)//per_page)
+if st.button("« Trước") and page>1:
+    page -= 1
+    st.session_state.page = page
+if st.button("Sau »") and page<pages:
+    page += 1
+    st.session_state.page = page
+st.write(f"Trang {page} / {pages}")
 
-coln1, coln2, coln3 = st.columns([1,1,8])
-with coln1:
-    if st.button("« Trước") and st.session_state.page > 1:
-        st.session_state.page -= 1
-with coln2:
-    if st.button("Sau »") and st.session_state.page < total_pages:
-        st.session_state.page += 1
-with coln3:
-    st.write(f"Trang {st.session_state.page} / {total_pages}")
+start = (page-1)*per_page
+page_items = results[start:start+per_page]
 
-start = (st.session_state.page - 1) * page_size
-end = start + page_size
-page_items = results[start:end]
-
-# Left: list / grid; Right: detail
 left, right = st.columns([2,4])
 with left:
     st.subheader("Danh sách kết quả")
-
-    # Thử dùng AgGrid nếu cài đặt
-    use_ag = False
-    try:
-        from st_aggrid import AgGrid, GridOptionsBuilder
-        use_ag = True
-    except Exception:
-        use_ag = False
-
-    df_page = records_to_df(page_items)
-
-    # Trường hợp không có dữ liệu
     if not page_items:
-        st.info("Không có dữ liệu để hiển thị. Vui lòng upload hoặc tạo index trước.")
-    elif df_page.empty:
-        st.write("Không có kết quả để hiển thị.")
+        st.info("Không có dữ liệu để hiển thị. Upload hoặc chọn file.")
     else:
-        # Hiển thị bảng kết quả
-        if use_ag:
-            gb = GridOptionsBuilder.from_dataframe(df_page[["sheet","ID","category","question"]])
-            gb.configure_selection(selection_mode="single", use_checkbox=False)
-            gb.configure_column("question", wrapText=True, autoHeight=True)
-            grid_resp = AgGrid(df_page, gridOptions=gb.build(), height=400, enable_enterprise_modules=False)
-            selected = grid_resp.get("selected_rows", [])
-            if selected:
-                sel_row = selected[0]
-                sel_idx = None
-                for i, r in enumerate(results):
-                    if (
-                        r.get("sheet") == sel_row.get("sheet")
-                        and str(r.get("ID")) == str(sel_row.get("ID"))
-                    ):
-                        sel_idx = i
-                        break
-                if sel_idx is not None:
-                    st.session_state.selected_idx = sel_idx
-        else:
-            # Dùng radio list đơn giản nếu chưa có AgGrid
-            titles = [
-                f"{r.get('sheet', '?')} | ID {r.get('ID', '?')} | {str(r.get('question', ''))[:80].replace(chr(10), ' ')}"
-                for r in page_items
-            ]
-            choice = st.radio(
-                "Chọn 1 câu hỏi để xem chi tiết:",
-                options=list(range(len(page_items))),
-                format_func=lambda i: titles[i],
-            )
-            st.session_state.selected_idx = start + choice
+        opts = []
+        for i, r in enumerate(page_items):
+            title = f"{r['sheet']} | ID {r['ID']} | {r['question'][:80].replace(chr(10),' ')}"
+            if st.button(title, key=f"btn_{start+i}"):
+                st.session_state["selected"] = start+i
 
 with right:
-    sel = st.session_state.get("selected_idx", start if page_items else None)
-    if sel is None:
-        if page_items:
-            sel = start
-            st.session_state.selected_idx = sel
-    if sel is None or sel >= len(results):
-        st.info("Chưa có bản ghi hợp lệ để hiển thị.")
-    else:
+    sel = st.session_state.get("selected", 0)
+    if results and sel < len(results):
         r = results[sel]
-        st.subheader(f"[{r.get('sheet')}] ID: {r.get('ID')}  —  Nhóm: {r.get('category')}")
-        # highlight question
+        st.subheader(f"[{r.get('sheet')}] ID: {r.get('ID')} — Nhóm: {r.get('category')}")
         st.markdown("**Câu hỏi:**")
-        st.markdown(highlight(r.get("question",""), query), unsafe_allow_html=True)
+        st.write(r.get("question"))
         st.markdown("**Đáp án:**")
-        opts = [("A", r.get("option_a","")), ("B", r.get("option_b","")), ("C", r.get("option_c","")), ("D", r.get("option_d",""))]
-        for k,val in opts:
+        for k,v in [("A", r.get("option_a")), ("B", r.get("option_b")), ("C", r.get("option_c")), ("D", r.get("option_d"))]:
             if k == (r.get("correct") or "").upper():
-                st.markdown(f"<div style='background:#ecfdf5;padding:6px;border-radius:6px'><b>→ {k}. {highlight(val, query)}</b></div>", unsafe_allow_html=True)
+                st.success(f"{k}. {v}")
             else:
-                st.markdown(f"{k}. {highlight(val, query)}", unsafe_allow_html=True)
+                st.write(f"{k}. {v}")
         st.markdown(f"**Đáp án đúng:** `{r.get('correct')}`")
+        detail_txt = f"[{r.get('sheet')}] ID: {r.get('ID')} | Nhóm: {r.get('category')}\n\n{r.get('question')}\n\nA. {r.get('option_a')}\nB. {r.get('option_b')}\nC. {r.get('option_c')}\nD. {r.get('option_d')}\n\nĐáp án đúng: {r.get('correct')}\n"
+        st.download_button("Tải câu chi tiết (TXT)", data=detail_txt, file_name=f"detail_{r.get('sheet')}_{r.get('ID')}.txt")
 
-        # download / copy
-        detail_text = f"[{r.get('sheet')}] ID: {r.get('ID')} | Nhóm: {r.get('category')}\n\n{r.get('question')}\n\n"
-        for k, val in opts:
-            prefix = "→" if k == (r.get("correct") or "").upper() else "  "
-            detail_text += f"{prefix} {k}. {val}\n"
-        detail_text += f"\nĐáp án đúng: {r.get('correct')}\n"
-
-        st.download_button("Tải câu chi tiết (TXT)", data=detail_text, file_name=f"detail_{r.get('sheet')}_{r.get('ID')}.txt", mime="text/plain")
-
-        # copy to clipboard via JS (works in supported browsers)
-        copy_html = f"""
-        <textarea id="txt_{sel}" style="display:none;">{detail_text.replace('&','&amp;').replace('<','&lt;')}</textarea>
-        <button onclick="const t=document.getElementById('txt_{sel}'); navigator.clipboard.writeText(t.value).then(()=>{{alert('Đã sao chép vào clipboard')}}).catch(()=>{{alert('Không thể copy - trình duyệt không hỗ trợ')}})">Sao chép câu/đáp án</button>
-        """
-        st.components.v1.html(copy_html, height=50)
-
-# Download entire current results
-if total > 0:
-    df_all = records_to_df(results)
-    csv_bytes = df_all.to_csv(index=False).encode('utf-8')
-    st.download_button("Tải toàn bộ kết quả (CSV)", data=csv_bytes, file_name="ketqua_tracuu.csv", mime="text/csv")
+# allow CSV download of results
+if results:
+    df = pd.DataFrame(results)
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("Tải toàn bộ kết quả (CSV)", data=csv, file_name="results.csv", mime="text/csv")
 
 st.markdown("---")
-st.caption("Gợi ý: Upload file Excel và click 'Tạo/ghi lại index' để cập nhật dữ liệu. "
-           "Để hoạt động tốt với dataset lớn, hãy chạy convert_xlsx_to_sqlite.py offline và commit questions.db hoặc lưu DB trên storage phù hợp.")
-
-# --- end ---
+st.caption("Phiên bản nhanh & an toàn: đọc Excel bằng pandas. Nếu bạn muốn, mình sẽ giúp khôi phục SQLite/FTS sau khi app ổn định.")
