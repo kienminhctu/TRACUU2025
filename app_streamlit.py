@@ -141,7 +141,8 @@ def read_excel_to_records(xlsx_path) -> (List[Dict], List[str]):
     return records, valid_sheets
 
 # --- Search functions ---
-import re, unicodedata
+# Thay thế toàn bộ hàm search_fts cũ bằng hàm này
+import re, unicodedata, sqlite3
 
 def normalize_text(s):
     if s is None:
@@ -151,11 +152,14 @@ def normalize_text(s):
     return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
 
 def search_fts(conn, query: str, category: str = None, limit: int = 500):
-    """Tìm kiếm thông minh (FTS hoặc LIKE, có/không dấu đều khớp)."""
+    """
+    Tìm kiếm an toàn: ưu tiên FTS (nếu có), nếu FTS lỗi -> fallback dùng search_text LIKE.
+    Trả list[dict].
+    """
     q = (query or "").strip()
     cur = conn.cursor()
 
-    # Nếu không có từ khóa: trả toàn bộ hoặc lọc theo category
+    # nếu rỗng query -> trả all (hoặc theo category)
     if q == "":
         if category and category != "(Tất cả)":
             cur.execute("SELECT rowid, * FROM questions WHERE category = ? LIMIT ?", (category, limit))
@@ -164,56 +168,53 @@ def search_fts(conn, query: str, category: str = None, limit: int = 500):
         return [dict(r) for r in cur.fetchall()]
 
     nq = normalize_text(q)
+    tokens = [t for t in re.split(r"\s+", nq) if t]
 
-    # --- Ưu tiên FTS5 ---
+    # 1) thử FTS trên qfts_search nếu tồn tại — nhưng bọc try/except để tránh crash
     try:
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='qfts_search'")
         if cur.fetchone():
+            # dùng MATCH trên trường search_text (đã normalize)
+            match_q = nq  # FTS query: we keep normalized plain text
             if category and category != "(Tất cả)":
-                cur.execute("""
-                    SELECT q.rowid, q.*
-                    FROM qfts_search f
-                    JOIN questions q ON q.rowid = f.rowid
-                    WHERE q.category = ? AND f.search_text MATCH ?
-                    LIMIT ?
-                """, (category, nq, limit))
+                sql = "SELECT q.rowid, q.* FROM qfts_search f JOIN questions q ON q.rowid=f.rowid WHERE q.category = ? AND f.search_text MATCH ? LIMIT ?"
+                params = (category, match_q, limit)
             else:
-                cur.execute("""
-                    SELECT q.rowid, q.*
-                    FROM qfts_search f
-                    JOIN questions q ON q.rowid = f.rowid
-                    WHERE f.search_text MATCH ?
-                    LIMIT ?
-                """, (nq, limit))
-            rows = [dict(r) for r in cur.fetchall()]
-            if rows:
-                return rows
-    except Exception as e:
-        # FTS lỗi hoặc không hỗ trợ → fallback
-        print("FTS error:", e)
+                sql = "SELECT q.rowid, q.* FROM qfts_search f JOIN questions q ON q.rowid=f.rowid WHERE f.search_text MATCH ? LIMIT ?"
+                params = (match_q, limit)
+            try:
+                cur.execute(sql, params)
+                rows = [dict(r) for r in cur.fetchall()]
+                if rows:
+                    return rows
+            except sqlite3.OperationalError:
+                # nếu FTS MATCH gặp lỗi ở runtime, ta sẽ fallback bên dưới
+                pass
+    except Exception:
+        # bất kỳ lỗi truy vấn metadata cũng bỏ qua và sử dụng fallback
+        pass
 
-    # --- Fallback LIKE: tìm không dấu ---
-    tokens = [t for t in re.split(r"\s+", nq) if t]
+    # 2) Fallback an toàn: tìm bằng search_text LIKE (AND trên token)
     if not tokens:
         return []
 
     clauses = []
     params = []
-
     if category and category != "(Tất cả)":
         clauses.append("category = ?")
         params.append(category)
 
+    # mỗi token phải xuất hiện trong cột search_text (đã normalized)
     for t in tokens:
-        like = f"%{t}%"
         clauses.append("search_text LIKE ?")
-        params.append(like)
+        params.append(f"%{t}%")
 
     sql = "SELECT rowid, * FROM questions WHERE " + " AND ".join(clauses) + " LIMIT ?"
     params.append(limit)
-    cur.execute(sql, params)
-
+    # đảm bảo params là tuple khi truyền xuống sqlite
+    cur.execute(sql, tuple(params))
     return [dict(r) for r in cur.fetchall()]
+
 
 
 def get_all_categories(conn):
