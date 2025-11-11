@@ -368,7 +368,8 @@ page_items = results[start:end]
 left, right = st.columns([2,4])
 with left:
     st.subheader("Danh sách kết quả")
-    # try aggrid if installed
+
+    # Thử dùng AgGrid nếu cài đặt
     use_ag = False
     try:
         from st_aggrid import AgGrid, GridOptionsBuilder
@@ -377,11 +378,14 @@ with left:
         use_ag = False
 
     df_page = records_to_df(page_items)
+
+    # Trường hợp không có dữ liệu
     if not page_items:
         st.info("Không có dữ liệu để hiển thị. Vui lòng upload hoặc tạo index trước.")
     elif df_page.empty:
         st.write("Không có kết quả để hiển thị.")
     else:
+        # Hiển thị bảng kết quả
         if use_ag:
             gb = GridOptionsBuilder.from_dataframe(df_page[["sheet","ID","category","question"]])
             gb.configure_selection(selection_mode="single", use_checkbox=False)
@@ -392,25 +396,25 @@ with left:
                 sel_row = selected[0]
                 sel_idx = None
                 for i, r in enumerate(results):
-                    if r.get("sheet") == sel_row.get("sheet") and str(r.get("ID")) == str(sel_row.get("ID")):
+                    if (
+                        r.get("sheet") == sel_row.get("sheet")
+                        and str(r.get("ID")) == str(sel_row.get("ID"))
+                    ):
                         sel_idx = i
                         break
                 if sel_idx is not None:
                     st.session_state.selected_idx = sel_idx
         else:
+            # Dùng radio list đơn giản nếu chưa có AgGrid
             titles = [
-                f"{r.get('sheet','?')} | ID {r.get('ID','?')} | {str(r.get('question',''))[:80].replace(chr(10),' ')}"
+                f"{r.get('sheet', '?')} | ID {r.get('ID', '?')} | {str(r.get('question', ''))[:80].replace(chr(10), ' ')}"
                 for r in page_items
             ]
-            choice = st.radio("Chọn 1:", options=list(range(len(page_items))), format_func=lambda i: titles[i])
-            st.session_state.selected_idx = start + choice
-
-        else:
-            # simple clickable radio/selectbox
-            titles = [f"{r.get('sheet','?')} | ID {r.get('ID','?')} | {str(r.get('question',''))[:80].replace(chr(10),' ')}" for r in page_items]
-
-            choice = st.radio("Chọn 1:", options=list(range(len(page_items))), format_func=lambda i: titles[i])
-            # map to global index
+            choice = st.radio(
+                "Chọn 1 câu hỏi để xem chi tiết:",
+                options=list(range(len(page_items))),
+                format_func=lambda i: titles[i],
+            )
             st.session_state.selected_idx = start + choice
 
 with right:
