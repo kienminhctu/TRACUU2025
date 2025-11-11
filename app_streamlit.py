@@ -378,9 +378,8 @@ with left:
 
     df_page = records_to_df(page_items)
     if not page_items:
-    st.info("Không có dữ liệu để hiển thị. Vui lòng upload hoặc tạo index trước.")
-
-    if df_page.empty:
+        st.info("Không có dữ liệu để hiển thị. Vui lòng upload hoặc tạo index trước.")
+    elif df_page.empty:
         st.write("Không có kết quả để hiển thị.")
     else:
         if use_ag:
@@ -391,15 +390,21 @@ with left:
             selected = grid_resp.get("selected_rows", [])
             if selected:
                 sel_row = selected[0]
-                # find index in results
-                # grid returns columns so map back
                 sel_idx = None
                 for i, r in enumerate(results):
-                    if r["sheet"] == sel_row["sheet"] and str(r["ID"]) == str(sel_row["ID"]):
+                    if r.get("sheet") == sel_row.get("sheet") and str(r.get("ID")) == str(sel_row.get("ID")):
                         sel_idx = i
                         break
                 if sel_idx is not None:
                     st.session_state.selected_idx = sel_idx
+        else:
+            titles = [
+                f"{r.get('sheet','?')} | ID {r.get('ID','?')} | {str(r.get('question',''))[:80].replace(chr(10),' ')}"
+                for r in page_items
+            ]
+            choice = st.radio("Chọn 1:", options=list(range(len(page_items))), format_func=lambda i: titles[i])
+            st.session_state.selected_idx = start + choice
+
         else:
             # simple clickable radio/selectbox
             titles = [f"{r.get('sheet','?')} | ID {r.get('ID','?')} | {str(r.get('question',''))[:80].replace(chr(10),' ')}" for r in page_items]
