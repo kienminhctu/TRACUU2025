@@ -377,6 +377,9 @@ with left:
         use_ag = False
 
     df_page = records_to_df(page_items)
+    if not page_items:
+    st.info("Không có dữ liệu để hiển thị. Vui lòng upload hoặc tạo index trước.")
+
     if df_page.empty:
         st.write("Không có kết quả để hiển thị.")
     else:
@@ -399,7 +402,8 @@ with left:
                     st.session_state.selected_idx = sel_idx
         else:
             # simple clickable radio/selectbox
-            titles = [f"{r['sheet']} | ID {r['ID']} | {r['question'][:80].replace(chr(10),' ')}" for r in page_items]
+            titles = [f"{r.get('sheet','?')} | ID {r.get('ID','?')} | {str(r.get('question',''))[:80].replace(chr(10),' ')}" for r in page_items]
+
             choice = st.radio("Chọn 1:", options=list(range(len(page_items))), format_func=lambda i: titles[i])
             # map to global index
             st.session_state.selected_idx = start + choice
