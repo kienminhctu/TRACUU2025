@@ -154,13 +154,14 @@ def normalize_text(s):
 
 def search_fts(conn, query: str, category: str = None, limit: int = 500):
     """
-    Robust search: try FTS (qfts_search) then fallback to search_text LIKE.
-    This version prints debug info (sql + params + exception) to the UI for diagnosis.
+    Tìm kiếm an toàn: ưu tiên FTS trên qfts_search (nếu có),
+    nếu FTS không trả kết quả hoặc lỗi thì fallback dùng search_text LIKE.
+    Trả list[dict].
     """
     q = (query or "").strip()
     cur = conn.cursor()
 
-    # empty query => return all or filtered by category
+    # Nếu không có từ khóa: trả toàn bộ hoặc theo category
     if q == "":
         try:
             if category and category != "(Tất cả)":
@@ -169,77 +170,74 @@ def search_fts(conn, query: str, category: str = None, limit: int = 500):
                 cur.execute("SELECT rowid, * FROM questions LIMIT ?", (limit,))
             return [dict(r) for r in cur.fetchall()]
         except Exception as e:
-            st.error("Debug SQL error (empty query): " + repr(e))
+            # Nếu lỗi ở đây, trả empty list thay vì crash
+            st.error("[DEBUG] Error fetching empty-query results: " + repr(e))
             return []
 
+    # normalize query (không dấu)
     nq = normalize_text(q)
     tokens = [t for t in re.split(r"\s+", nq) if t]
+    if not tokens:
+        return []
 
-    # 1) Try FTS on qfts_search (guarded)
+    # 1) Thử FTS trên qfts_search (nếu tồn tại)
     try:
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='qfts_search'")
         if cur.fetchone():
-            # prepare FTS query (we use normalized search_text content)
-            match_q = nq
-            if category and category != "(Tất cả)":
-                sql = "SELECT q.rowid, q.* FROM qfts_search f JOIN questions q ON q.rowid = f.rowid WHERE q.category = ? AND f.search_text MATCH ? LIMIT ?"
-                params = (category, match_q, limit)
-            else:
-                sql = "SELECT q.rowid, q.* FROM qfts_search f JOIN questions q ON q.rowid = f.rowid WHERE f.search_text MATCH ? LIMIT ?"
-                params = (match_q, limit)
-            # debug print (temporary)
-            st.debug = getattr(st, "debug", None)
+            # BUILD và chạy truy vấn FTS — bọc try để không làm crash
             try:
-                # show debug info for diagnosis
+                if category and category != "(Tất cả)":
+                    sql = "SELECT q.rowid, q.* FROM qfts_search f JOIN questions q ON q.rowid = f.rowid WHERE q.category = ? AND f.search_text MATCH ? LIMIT ?"
+                    params = (category, nq, limit)
+                else:
+                    sql = "SELECT q.rowid, q.* FROM qfts_search f JOIN questions q ON q.rowid = f.rowid WHERE f.search_text MATCH ? LIMIT ?"
+                    params = (nq, limit)
+                # debug info (tạm)
                 st.info(f"[DEBUG] Trying FTS. SQL: {sql}  params={params}")
-            except Exception:
-                pass
-            try:
                 cur.execute(sql, params)
                 rows = [dict(r) for r in cur.fetchall()]
                 if rows:
                     return rows
+            except sqlite3.OperationalError as e:
+                # FTS có thể không hỗ trợ MATCH theo cách này trên cloud — fallback tiếp
+                st.error("[DEBUG] FTS OperationalError: " + repr(e))
             except Exception as e:
-                # log the low-level exception to UI (for you to copy)
-                st.error("[DEBUG] FTS query error: " + repr(e))
-                # also show traceback on UI for diagnosis (safe since it's your app)
-                st.text("".join(traceback.format_exc()))
-                # fall through to LIKE fallback
+                st.error("[DEBUG] FTS error: " + repr(e))
+    except Exception:
+        # nếu metadata check lỗi, tiếp tục fallback
+        pass
+
+    # 2) Fallback: tìm trong search_text dùng LIKE (AND token)
+    clauses = []
+    params = []
+    if category and category != "(Tất cả)":
+        clauses.append("category = ?")
+        params.append(category)
+
+    for t in tokens:
+        clauses.append("search_text LIKE ?")
+        params.append(f"%{t}%")
+
+    # Nếu không có điều kiện (không nên xảy ra vì tokens đã kiểm tra), trả rỗng
+    if not clauses:
+        return []
+
+    # NOTE: không dùng parameter hóa LIMIT do một số build sqlite không hỗ trợ binding cho LIMIT
+    where_clause = " AND ".join(clauses)
+    sql = f"SELECT rowid, * FROM questions WHERE {where_clause} LIMIT {int(limit)}"
+
+    # debug info (hiển thị tạm thời trên UI để bạn thấy)
+    st.info(f"[DEBUG] Fallback SQL: {sql}")
+    st.info(f"[DEBUG] Fallback params: {params}")
+
+    try:
+        cur.execute(sql, tuple(params))
+        rows = [dict(r) for r in cur.fetchall()]
+        return rows
     except Exception as e:
-        st.error("[DEBUG] Metadata check for qfts_search failed: " + repr(e))
+        st.error("[DEBUG] Fallback SQL error: " + repr(e))
         st.text("".join(traceback.format_exc()))
-
-    # 2) Fallback: use normalized search_text LIKE with AND tokens
-   # --- Fallback LIKE (no diacritics, safe on Cloud) ---
-if not tokens:
-    return []
-
-clauses = []
-params = []
-if category and category != "(Tất cả)":
-    clauses.append("category = ?")
-    params.append(category)
-
-for t in tokens:
-    clauses.append("search_text LIKE ?")
-    params.append(f"%{t}%")
-
-where_clause = " AND ".join(clauses)
-# ⚠️ KHÔNG dùng LIMIT ? vì Cloud SQLite không hỗ trợ binding LIMIT
-sql = f"SELECT rowid, * FROM questions WHERE {where_clause} LIMIT {int(limit)}"
-
-st.info(f"[DEBUG] Safe SQL: {sql}")
-st.info(f"[DEBUG] Params: {params}")
-
-try:
-    cur.execute(sql, tuple(params))
-    rows = [dict(r) for r in cur.fetchall()]
-    return rows
-except Exception as e:
-    st.error("[DEBUG] Fallback SQL error: " + repr(e))
-    import traceback
-    st.text("".join(traceback.format_exc()))
-    return []
+        return []
 
 
 def get_all_categories(conn):
