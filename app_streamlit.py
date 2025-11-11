@@ -141,49 +141,80 @@ def read_excel_to_records(xlsx_path) -> (List[Dict], List[str]):
     return records, valid_sheets
 
 # --- Search functions ---
+import re, unicodedata
+
+def normalize_text(s):
+    if s is None:
+        return ""
+    s = str(s).lower()
+    s = unicodedata.normalize("NFD", s)
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+
 def search_fts(conn, query: str, category: str = None, limit: int = 500):
-    q = query.strip()
+    """Tìm kiếm thông minh (FTS hoặc LIKE, có/không dấu đều khớp)."""
+    q = (query or "").strip()
     cur = conn.cursor()
-    # if no query, simple select
+
+    # Nếu không có từ khóa: trả toàn bộ hoặc lọc theo category
     if q == "":
         if category and category != "(Tất cả)":
             cur.execute("SELECT rowid, * FROM questions WHERE category = ? LIMIT ?", (category, limit))
         else:
             cur.execute("SELECT rowid, * FROM questions LIMIT ?", (limit,))
-        rows = cur.fetchall()
-        return [dict(r) for r in rows]
-    # Use FTS if available
+        return [dict(r) for r in cur.fetchall()]
+
+    nq = normalize_text(q)
+
+    # --- Ưu tiên FTS5 ---
     try:
-        # Prepare FTS MATCH pattern: allow phrase and AND by default
-        match_query = q.replace("'", "''")
-        if category and category != "(Tất cả)":
-            sql = "SELECT q.rowid, q.id, q.sheet, q.category, q.question, q.option_a, q.option_b, q.option_c, q.option_d, q.correct FROM qfts JOIN questions q ON q.rowid = qfts.rowid WHERE q.category = ? AND qfts MATCH ? LIMIT ?"
-            cur.execute(sql, (category, match_query, limit))
-        else:
-            sql = "SELECT q.rowid, q.id, q.sheet, q.category, q.question, q.option_a, q.option_b, q.option_c, q.option_d, q.correct FROM qfts JOIN questions q ON q.rowid = qfts.rowid WHERE qfts MATCH ? LIMIT ?"
-            cur.execute(sql, (match_query, limit))
-        rows = cur.fetchall()
-        return [dict(r) for r in rows]
-    except Exception:
-        # fallback to simple LIKE-based token AND search
-        tokens = [t for t in re.split(r"\s+", normalize_text(q)) if t]
-        if not tokens:
-            return []
-        base_sql = "SELECT rowid, * FROM questions WHERE "
-        clauses = []
-        params = []
-        if category and category != "(Tất cả)":
-            clauses.append("category = ?")
-            params.append(category)
-        for t in tokens:
-            clauses.append("(lower(question) LIKE ? OR lower(option_a) LIKE ? OR lower(option_b) LIKE ? OR lower(option_c) LIKE ? OR lower(option_d) LIKE ?)")
-            for _ in range(5):
-                params.append(f"%{t}%")
-        sql = base_sql + " AND ".join(clauses) + " LIMIT ?"
-        params.append(limit)
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-        return [dict(r) for r in rows]
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='qfts_search'")
+        if cur.fetchone():
+            if category and category != "(Tất cả)":
+                cur.execute("""
+                    SELECT q.rowid, q.*
+                    FROM qfts_search f
+                    JOIN questions q ON q.rowid = f.rowid
+                    WHERE q.category = ? AND f.search_text MATCH ?
+                    LIMIT ?
+                """, (category, nq, limit))
+            else:
+                cur.execute("""
+                    SELECT q.rowid, q.*
+                    FROM qfts_search f
+                    JOIN questions q ON q.rowid = f.rowid
+                    WHERE f.search_text MATCH ?
+                    LIMIT ?
+                """, (nq, limit))
+            rows = [dict(r) for r in cur.fetchall()]
+            if rows:
+                return rows
+    except Exception as e:
+        # FTS lỗi hoặc không hỗ trợ → fallback
+        print("FTS error:", e)
+
+    # --- Fallback LIKE: tìm không dấu ---
+    tokens = [t for t in re.split(r"\s+", nq) if t]
+    if not tokens:
+        return []
+
+    clauses = []
+    params = []
+
+    if category and category != "(Tất cả)":
+        clauses.append("category = ?")
+        params.append(category)
+
+    for t in tokens:
+        like = f"%{t}%"
+        clauses.append("search_text LIKE ?")
+        params.append(like)
+
+    sql = "SELECT rowid, * FROM questions WHERE " + " AND ".join(clauses) + " LIMIT ?"
+    params.append(limit)
+    cur.execute(sql, params)
+
+    return [dict(r) for r in cur.fetchall()]
+
 
 def get_all_categories(conn):
     cur = conn.cursor()
